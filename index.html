@@ -134,6 +134,7 @@ nav.tabs .spacer{flex:1;min-width:var(--s4)}
 @media (max-width:1100px){.stdgrid{grid-template-columns:1fr}}
 
 /* ---------- resultados ---------- */
+.cmptab table{font-size:13px} .cmptab th[scope=row]{font-weight:500;color:var(--fg);cursor:default;position:static;white-space:normal;min-width:150px} .cmptab th[scope=row] .sub{font-weight:400} .cmptab thead th{cursor:default} .cmptab td{white-space:nowrap} .cmptab td .sub{white-space:normal;max-width:28ch}
 .results{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,7fr);gap:var(--s4);margin-top:var(--s4);align-items:start}
 @media (max-width:1000px){.results{grid-template-columns:1fr}}
 .res{background:var(--surface);border-radius:var(--r);padding:var(--s4) var(--s4);box-shadow:var(--shadow);min-width:0}
@@ -304,7 +305,7 @@ details.dq-item .body{padding:0 12px 10px 12px;font-size:13px;color:var(--muted)
       <select id="fTeam" aria-label="Filtrar por equipo"><option value="">Todos los equipos</option></select>
       <select id="fProfile" aria-label="Filtrar por modalidad"><option value="">Todas las modalidades</option><option value="MIXTO">Flujo Mixto</option><option value="SOPORTE">Soporte fijo</option><option value="BACKUP">Backup de Soporte</option><option value="TL">Team Leaders</option><option value="CP">Coordinación</option><option value="NONE">No evaluados</option></select>
       <select id="fState" aria-label="Filtrar por estado"><option value="">Todos los estados</option></select>
-      <label class="switch small" style="justify-content:flex-start"><input type="checkbox" id="fChanged"> Solo personas con cambios</label>
+      <select id="fChange" aria-label="Filtrar por cambios respecto de la referencia"><option value="">Todas las personas</option><option value="any">Con algún cambio comparable</option><option value="prod">Cambia Productividad</option><option value="units">Cambian unidades computables</option><option value="qual">Cambia Calidad</option><option value="soft">Cambia Soft Skills</option><option value="total">Cambia el puntaje total</option><option value="partial">Cambia el puntaje parcial</option><option value="avail">Cambia la disponibilidad de Soft Skills</option><option value="nc">Sin puntaje total comparable</option></select>
       <span class="grow"></span>
       <span class="muted small" id="rowCount"></span>
       <label class="switch small" style="justify-content:flex-start"><input type="checkbox" id="techView"> Vista técnica</label>
@@ -981,18 +982,132 @@ document.getElementById('drawer2').addEventListener('click',e=>{ if(e.target.id=
 // ---------------- Results ----------------
 // Comparison between two evaluated scenarios. Each scenario is evaluated with its own parameters and values.
 // Total delta exists only when BOTH have a total score; if neither has one, the partial score (Prod+Calidad) is compared and labeled as such; if only one has it, the pair is "no comparable" (never a fabricated zero).
+// ---------------- Comparación entre escenarios (presentación; no toca el motor) ----------------
+// Cada componente decide su propia comparabilidad. Nunca se fabrica una diferencia: si un lado no tiene valor o las bases
+// metodológicas difieren (modalidad, modelo, cambio de modalidad, transición, período), el componente queda "no comparable" con motivo.
+const EPS=0.05;
+function cmpComponent(a,b,okA,okB,reasonNc){
+  // a,b: valores (null = sin valor). okA/okB: el valor existe y tiene base válida. reasonNc: motivo si las bases no coinciden.
+  if(reasonNc) return {a,b,d:null,state:'nc',why:reasonNc};
+  if(a==null&&b==null) return {a,b,d:null,state:'none',why:''};
+  if(a==null||b==null) return {a,b,d:null,state:'one',why:a==null?'solo el escenario actual tiene este valor':'solo el escenario de referencia tiene este valor'};
+  if(!okA||!okB) return {a,b,d:null,state:'nc',why:'sin base válida en uno de los escenarios'};
+  return {a,b,d:b-a,state:'ok',why:''};
+}
+function unitsOf(r){ return r.prod&&r.prod.cdmTotal!=null? r.prod.cdmTotal : null; }
 function compareRows(rowsRef,rowsNow,cRef,cNow){
   const byRef={}; rowsRef.forEach(r=>byRef[r.uid]=r);
+  const periodDiff=(cRef.period&&cRef.period.from||null)!==(cNow.period&&cNow.period.from||null)||(cRef.period&&cRef.period.to||null)!==(cNow.period&&cNow.period.to||null);
   const pairs=rowsNow.map(r=>{ const a=byRef[r.uid]; const dif=(x,y)=>(x!=null&&y!=null)?y-x:null;
-    let va=null,vb=null,d=null,basis=null;
-    if(a){ if(a.final!=null&&r.final!=null){ va=a.final; vb=r.final; d=vb-va; basis='total'; }
-      else if(a.final==null&&r.final==null){ va=partialScore(a,cRef); vb=partialScore(r,cNow); d=dif(va,vb); basis=d!=null?'partial':null; }
-      else { va=a.final!=null?a.final:partialScore(a,cRef); vb=r.final!=null?r.final:partialScore(r,cNow); basis='nc'; } }
-    return {uid:r.uid,name:r.name,team:r.team,a:va,b:vb,d,basis,dp:a?dif(a.prod.score,r.prod.score):null,dq:a?dif(a.qual.adj,r.qual.adj):null,ds:a?dif(a.soft,r.soft):null,softA:a?a.soft:null,softB:r.soft,rankA:a?a.rank:null,rankB:r.rank}; });
+    let va=null,vb=null,d=null,basis=null,totalWhy='';
+    const blank={a:null,b:null,d:null,state:'none',why:''};
+    let prod=blank,qual=blank,soft=blank,total=blank,units=null;
+    if(a){
+      const evalBoth=!a.leader&&!r.leader;
+      // bases: misma modalidad y mismo modelo aplicado; sin cambio de modalidad ni transición en ninguno de los dos
+      let baseWhy=''; if(periodDiff) baseWhy='los escenarios usan períodos de cálculo distintos';
+      else if((a.prod&&a.prod.multi)||(r.prod&&r.prod.multi)) baseWhy='cambio de modalidad dentro del período: sin total definitivo';
+      else if((a.prod&&a.prod.transition)||(r.prod&&r.prod.transition)) baseWhy='transición de modalidad: resultado provisional';
+      else if(a.mode!==r.mode) baseWhy='la persona tiene modalidades distintas en cada escenario';
+      else if(a.prod&&r.prod&&a.prod.model&&r.prod.model&&a.prod.model!==r.prod.model) baseWhy='se evalúan con modelos distintos';
+      if(evalBoth){
+        prod=cmpComponent(a.prod.score,r.prod.score,a.prod.score!=null,r.prod.score!=null,baseWhy);
+        const ua=unitsOf(a), ub=unitsOf(r); if(ua!=null&&ub!=null&&!baseWhy){ units={a:ua,b:ub,d:ub-ua,extraA:a.prod.subExtra||0,extraB:r.prod.subExtra||0}; }
+        // unidades suben pero el puntaje no: tope de la escala
+        if(units&&units.d>EPS&&prod.state==='ok'&&Math.abs(prod.d)<=EPS&&r.prod.score>=100-1e-9) prod={...prod,capped:true};
+        const qa=a.qual.status==='na', qb=r.qual.status==='na';
+        if(qa&&qb) qual={a:null,b:null,d:null,state:'na',why:'la Calidad no aplica a esta modalidad'};
+        else if(qa!==qb) qual={a:a.qual.adj,b:r.qual.adj,d:null,state:'nc',why:'la Calidad aplica solo en uno de los escenarios'};
+        else qual=cmpComponent(a.qual.adj,r.qual.adj,a.qual.adj!=null,r.qual.adj!=null,baseWhy);
+        // Soft Skills: pasar de sin evaluación a simulado es un cambio de disponibilidad, no numérico
+        soft=cmpComponent(a.soft,r.soft,a.soft!=null,r.soft!=null,baseWhy);
+        if(soft.state==='one') soft={...soft,avail:true,why:a.soft==null?`pasa de sin evaluación a ${r.softStatus==='sim'?'simulado':'cargado'}`:`pasa de ${a.softStatus==='sim'?'simulado':'cargado'} a sin evaluación`};
+        else if(soft.state==='ok'&&a.softStatus!==r.softStatus) soft={...soft,statusChange:`${a.softStatus==='sim'?'simulado':'confirmado'} → ${r.softStatus==='sim'?'simulado':'confirmado'}`};
+      }
+      // puntaje total: ambos totales → comparable; ninguno → parcial (Prod+Calidad); uno solo → no comparable (motivo: falta Soft Skills de un lado)
+      if(a.leader_res||r.leader_res){ const la=a.leader_res?a.leader_res.score:null, lb=r.leader_res?r.leader_res.score:null; va=la; vb=lb;
+        if(periodDiff){ basis=(la!=null||lb!=null)?'nc':null; total={a:la,b:lb,d:null,state:(la==null&&lb==null)?'none':'nc',why:'los escenarios usan períodos de cálculo distintos'}; }
+        else { if(la!=null&&lb!=null){ d=lb-la; basis='total'; } else { basis=null; } total={a:la,b:lb,d,state:d!=null?'ok':(la==null&&lb==null?'none':'one'),why:d!=null?'':'evaluación de líder pendiente en un escenario'}; } }
+      else if(baseWhy){ va=a.final!=null?a.final:partialScore(a,cRef); vb=r.final!=null?r.final:partialScore(r,cNow); basis='nc'; totalWhy=baseWhy; total={a:va,b:vb,d:null,state:'nc',why:baseWhy}; }
+      else if(a.final!=null&&r.final!=null){ va=a.final; vb=r.final; d=vb-va; basis='total'; total={a:va,b:vb,d,state:'ok',why:''}; }
+      else if(a.final==null&&r.final==null){ va=partialScore(a,cRef); vb=partialScore(r,cNow); d=dif(va,vb); basis=d!=null?'partial':null; total={a:va,b:vb,d,state:d!=null?'partial':'none',why:d!=null?'puntaje parcial (Productividad + Calidad): ninguno de los dos tiene Soft Skills':''}; }
+      else { va=a.final!=null?a.final:partialScore(a,cRef); vb=r.final!=null?r.final:partialScore(r,cNow); basis='nc'; totalWhy=a.final==null?'el escenario de referencia no tiene Soft Skills':'el escenario actual no tiene Soft Skills'; total={a:va,b:vb,d:null,state:'nc',why:totalWhy}; }
+    }
+    const comp={prod,qual,soft,total};
+    const changed=[]; if(prod.state==='ok'&&Math.abs(prod.d)>EPS) changed.push('prod'); if(qual.state==='ok'&&Math.abs(qual.d)>EPS) changed.push('qual'); if(soft.state==='ok'&&Math.abs(soft.d)>EPS) changed.push('soft'); if(total.state==='ok'&&Math.abs(total.d)>EPS) changed.push('total'); if(total.state==='partial'&&Math.abs(total.d)>EPS) changed.push('partial'); if(units&&Math.abs(units.d)>EPS) changed.push('units');
+    return {uid:r.uid,name:r.name,team:r.team,a:va,b:vb,d,basis,dp:prod.state==='ok'?prod.d:null,dq:qual.state==='ok'?qual.d:null,ds:soft.state==='ok'?soft.d:null,softA:a?a.soft:null,softB:r.soft,rankA:a?a.rank:null,rankB:r.rank,comp,units,changed,availChange:!!soft.avail||!!(soft.statusChange)}; });
   const nTotal=pairs.filter(p=>p.basis==='total').length, nPartial=pairs.filter(p=>p.basis==='partial').length, nNc=pairs.filter(p=>p.basis==='nc').length;
   const label= !nPartial?'Puntaje total': (!nTotal?'Puntaje parcial (Productividad + Calidad)':'Puntaje (total o parcial según la persona)');
-  return {pairs,label,nTotal,nPartial,nNc,hasFinal:nTotal>0};
+  // resumen por componente
+  const sum=k=>{ const key=k==='partial'?'total':k; const ok=pairs.filter(p=>p.comp[key].state===(k==='partial'?'partial':'ok')); const up=ok.filter(p=>p.comp[key].d>EPS).length, down=ok.filter(p=>p.comp[key].d<-EPS).length; const whys={}; pairs.filter(p=>!['ok','partial','none','na'].includes(p.comp[key].state)).forEach(p=>{ whys[p.comp[key].why]=(whys[p.comp[key].why]||0)+1; }); const na=pairs.filter(p=>p.comp[key].state==='na').length; return {n:ok.length,up,down,same:ok.length-up-down,nc:pairs.filter(p=>['nc','one'].includes(p.comp[key].state)).length,na,whys,capped:k==='prod'?ok.filter(p=>p.comp.prod.capped).length:0}; };
+  const summary={prod:sum('prod'),qual:sum('qual'),soft:sum('soft'),total:sum('total'),partial:sum('partial')};
+  const u=pairs.filter(p=>p.units); summary.units={n:u.length,up:u.filter(p=>p.units.d>EPS).length,down:u.filter(p=>p.units.d<-EPS).length,same:u.filter(p=>Math.abs(p.units.d)<=EPS).length};
+  summary.avail=pairs.filter(p=>p.availChange).length;
+  return {pairs,label,nTotal,nPartial,nNc,hasFinal:nTotal>0,summary,periodDiff};
 }
+// qué métrica muestra "mayores variaciones" y el gráfico por defecto: total si es comparable para la mayoría; si no, Productividad
+function defaultMetric(cmp){ const s=cmp.summary; if(s.total.n&&s.total.n>=s.total.nc) return 'total'; if(s.partial.n&&s.partial.n>=s.total.nc) return 'partial'; if(s.prod.n) return 'prod'; if(s.total.n) return 'total'; if(s.partial.n) return 'partial'; return 'prod'; }
+const METRIC_LBL={total:'Puntaje total',partial:'Puntaje parcial (Productividad + Calidad)',prod:'Productividad',qual:'Calidad',soft:'Soft Skills',units:'Unidades computables'};
+function metricDelta(p,m){ if(m==='units') return p.units?p.units.d:null; if(m==='partial') return p.comp.total.state==='partial'?p.comp.total.d:null; const c=p.comp[m]; return c.state==='ok'?c.d:null; }
+function metricVals(p,m){ if(m==='units') return p.units?[p.units.a,p.units.b]:[null,null]; const c=p.comp[m==='partial'?'total':m]; return [c.a,c.b]; }
+// unidades equivalentes: pueden tener fracción por el factor MAO; se muestra un decimal solo cuando existe
+function fmtUnits(v,signed){ if(v==null) return '—'; const r=Math.round(v*100)/100; const s=Number.isInteger(r)? r.toLocaleString('es-AR') : r.toLocaleString('es-AR',{minimumFractionDigits:1,maximumFractionDigits:2}); return (signed&&r>0?'+':'')+s; }
+// ---------------- Presentación del comparador (compartida por Simulación y Escenarios) ----------------
+let CMP_METRIC=null; // métrica elegida para "mayores variaciones" y el gráfico; null = automática
+function cmpMeans(cmp,k){ const key=k==='partial'?'total':k; const ok=cmp.pairs.filter(p=>p.comp[key].state===(k==='partial'?'partial':'ok')); return {a:mean(ok.map(p=>p.comp[key].a)),b:mean(ok.map(p=>p.comp[key].b)),n:ok.length}; }
+function whyList(whys){ return Object.entries(whys).sort((x,y)=>y[1]-x[1]).map(([w,n])=>`${n}: ${w}`).join(' · '); }
+function compareTableHtml(cmp,refLabel,nowLabel){
+  const s=cmp.summary; const f=v=>v==null?'—':f1(v); const dcls=d=>d==null?'zero':d>0.05?'pos':d<-0.05?'neg':'zero';
+  const row=(k,label,extra)=>{ const m=cmpMeans(cmp,k); const d=(m.a!=null&&m.b!=null)?m.b-m.a:null; const S=s[k]; const nc=S.nc; const base=cmp.pairs.filter(p=>p.comp[k].state!=='none'&&p.comp[k].state!=='na').length;
+    const compTxt= S.n? `${S.n} de ${base}`:(base?`0 de ${base}`:'—'); const note= (nc&&!(k==='soft'&&cmp.summary.avail))? `<span class="sub">${esc(whyList(S.whys))}</span>`:(S.na?`<span class="sub">${S.na} no aplica (Soporte fijo)</span>`:'');
+    return `<tr><th scope="row">${label}${extra||''}</th><td class="r num">${f(m.a)}</td><td class="r num">${f(m.b)}</td><td class="r"><span class="delta ${dcls(d)}">${d==null?'n/c':sgn(d)}</span></td><td class="r num">${compTxt}${note}</td><td class="r num"><span class="delta ${S.up?'pos':'zero'}">${S.up}</span></td><td class="r num"><span class="delta ${S.down?'neg':'zero'}">${S.down}</span></td><td class="r num">${S.same}</td></tr>`; };
+  // unidades computables (solo pares con base común)
+  const u=cmp.pairs.filter(p=>p.units); const ua=u.reduce((x,p)=>x+p.units.a,0), ub=u.reduce((x,p)=>x+p.units.b,0);
+  const unitsRow=u.length?`<tr><th scope="row">Unidades computables<span class="sub">suma de tareas y subunidades que cuentan</span></th><td class="r num">${fmtUnits(ua)}</td><td class="r num">${fmtUnits(ub)}</td><td class="r"><span class="delta ${dcls(ub-ua)}">${fmtUnits(ub-ua,true)}</span></td><td class="r num">${u.length}</td><td class="r num"><span class="delta ${s.units.up?'pos':'zero'}">${s.units.up}</span></td><td class="r num"><span class="delta ${s.units.down?'neg':'zero'}">${s.units.down}</span></td><td class="r num">${s.units.same}</td></tr>`:'';
+  const prodExtra=s.prod.capped?`<span class="sub">${s.prod.capped} con más unidades pero sin cambio de puntaje: ya estaban en el tope de 100</span>`:'';
+  const softExtra=s.avail?`<span class="sub">${s.avail} cambian de disponibilidad (${esc(whyList(s.soft.whys))}); no es una diferencia numérica</span>`:'';
+  const totalWhyTxt=s.total.nc?`<span class="sub">${esc(whyList(s.total.whys))}</span>`:'';
+  const scoreRow=(k,label,note)=>{ const m=cmpMeans(cmp,k); const d=(m.a!=null&&m.b!=null)?m.b-m.a:null; const S=s[k]; const base=k==='partial'?s.partial.n:cmp.pairs.filter(p=>!['none','partial'].includes(p.comp.total.state)).length; return `<tr><th scope="row">${label}${note}</th><td class="r num">${f(m.a)}</td><td class="r num">${f(m.b)}</td><td class="r"><span class="delta ${dcls(d)}">${d==null?'n/c':sgn(d)}</span></td><td class="r num">${S.n?`${S.n} de ${base}`:(base?`0 de ${base}`:'—')}</td><td class="r num"><span class="delta ${S.up?'pos':'zero'}">${S.up}</span></td><td class="r num"><span class="delta ${S.down?'neg':'zero'}">${S.down}</span></td><td class="r num">${S.same}</td></tr>`; };
+  const hasTotalBase=cmp.pairs.some(p=>!['none','partial'].includes(p.comp.total.state));
+  const totalRow=(hasTotalBase?scoreRow('total','Puntaje total',totalWhyTxt):'')+(s.partial.n?scoreRow('partial','Puntaje parcial','<span class="sub">Productividad + Calidad: ninguno de los dos escenarios tiene Soft Skills para estas personas. No se promedia junto con el total.</span>'):'');
+  return `<div class="tblwrap cmptab"><table><thead><tr><th>Métrica</th><th class="r">${esc(refLabel)}</th><th class="r">${esc(nowLabel)}</th><th class="r">Dif. promedio</th><th class="r">Comparables</th><th class="r">Suben</th><th class="r">Bajan</th><th class="r">Sin cambio</th></tr></thead><tbody>
+    ${row('prod','Productividad',prodExtra)}${unitsRow}${row('qual','Calidad')}${row('soft','Soft Skills',softExtra)}${totalRow}</tbody></table></div>
+    <p class="xs muted" style="margin-top:6px">Promedios calculados sobre las personas comparables en cada métrica (mismas personas en ambos lados). Una diferencia se considera cambio a partir de 0,1 punto.</p>`;
+}
+function compareExplainHtml(cmp,refLabel){
+  const s=cmp.summary; const parts=[];
+  if(cmp.periodDiff) return `<p class="note small" style="margin-top:10px"><b>Los escenarios usan períodos de cálculo distintos</b>: ninguna métrica individual es comparable, tampoco la evaluación de líderes. Los valores de cada lado siguen visibles como referencia histórica. Para comparar, usá el mismo período en los dos escenarios.</p>`;
+  if(s.partial.n&&!cmp.pairs.some(p=>p.comp.total.state==='ok')) parts.push(`Las ${s.partial.n} personas comparables no tienen Soft Skills en ninguno de los dos escenarios: se compara el puntaje parcial (Productividad + Calidad), no un total.`);
+  if(s.total.nc&&!s.total.n){ const why=Object.keys(s.total.whys)[0]||''; parts.push(`<b>El puntaje total no puede compararse</b> (${s.total.nc} persona${s.total.nc>1?'s':''}): ${esc(why)}.`); const ok=[s.prod.n?'Productividad':'',s.qual.n?'Calidad':''].filter(Boolean); if(ok.length) parts.push(`${ok.join(' y ')} sí ${ok.length>1?'pueden':'puede'} compararse${s.prod.n?` (${s.prod.up} suben, ${s.prod.down} bajan en Productividad)`:''}.`); if(/Soft Skills/.test(why)) parts.push(`Para comparar totales, los dos escenarios necesitan Soft Skills: guardá la referencia con el mismo valor estándar o cargá las evaluaciones.`); }
+  else if(s.total.nc) parts.push(`${s.total.nc} persona${s.total.nc>1?'s':''} sin puntaje total comparable: ${esc(whyList(s.total.whys))}.`);
+  if(cmp.periodDiff) parts.push('Los escenarios usan períodos de cálculo distintos: ninguna métrica individual es comparable.');
+  if(s.prod.nc&&!cmp.periodDiff) parts.push(`${s.prod.nc} persona${s.prod.nc>1?'s':''} sin Productividad comparable: ${esc(whyList(s.prod.whys))}.`);
+  if(s.units.up&&s.prod.capped) parts.push(`${s.units.up} persona${s.units.up>1?'s':''} suma${s.units.up>1?'n':''} unidades; ${s.prod.capped} de ellas no cambian de puntaje porque ya estaban en 100. Más unidades no equivale a mejor desempeño: el tope lo absorbe.`);
+  return parts.length?`<p class="note small" style="margin-top:10px">${parts.join(' ')}</p>`:'';
+}
+function metricOptions(cmp,sel){ const s=cmp.summary; const avail=[['total',s.total.n],['partial',s.partial.n],['prod',s.prod.n],['qual',s.qual.n],['soft',s.soft.n],['units',s.units.n]].filter(([k,n])=>!(k==='partial'&&!n)&&!(k==='total'&&!n&&!s.total.nc)); return avail.map(([k,n])=>`<option value="${k}" ${k===sel?'selected':''} ${n?'':'disabled'}>${METRIC_LBL[k]}${n?'':' (no comparable)'}</option>`).join(''); }
+function moversHtml(cmp,metric,limit=8){
+  const list=cmp.pairs.map(p=>({p,d:metricDelta(p,metric)})).filter(x=>x.d!=null&&Math.abs(x.d)>0.05).sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)).slice(0,limit); const maxD=Math.max(...list.map(x=>Math.abs(x.d)),0.1);
+  const n=cmp.pairs.filter(p=>metricDelta(p,metric)!=null).length; const fmt=d=>metric==='units'?fmtUnits(d,true):sgn(d);
+  const empty= n? `Sin cambios de ${METRIC_LBL[metric].toLowerCase()} entre las ${n} personas comparables.` : `${METRIC_LBL[metric]} no es comparable entre estos escenarios.`;
+  return `<div class="moves">${list.length?list.map(({p,d})=>`<div class="move"><span class="nm">${esc(p.name)}${metric==='prod'&&p.comp.prod.capped?' <span class="muted xs">tope</span>':''}</span><span class="delta ${d>0?'pos':'neg'}" style="text-align:right">${fmt(d)}</span><div class="bar"><i class="${d>0?'pos':'neg'}" style="width:${(Math.abs(d)/maxD*50).toFixed(1)}%"></i></div></div>`).join(''):`<span class="muted small">${empty}</span>`}</div>`;
+}
+function metricSeries(cmp,metric){ const a=[],b=[]; cmp.pairs.forEach(p=>{ const d=metricDelta(p,metric); if(d==null) return; const [x,y]=metricVals(p,metric); a.push(x); b.push(y); }); return {a,b}; }
+function renderCompareBlock(cmp,refLabel,nowLabel,sameCfg){
+  const metric=CMP_METRIC&&cmp.summary[CMP_METRIC==='units'?'units':CMP_METRIC].n? CMP_METRIC : defaultMetric(cmp); const ser=metricSeries(cmp,metric);
+  if(sameCfg) return `<div class="empty"><b>Todavía no cambiaste nada.</b> Modificá un objetivo, activá las subunidades MAO o las creaciones BC, cambiá el método de calidad o simulá valores de Soft Skills y acá vas a ver qué cambia, cuánto y para quién.</div>`;
+  return `${compareTableHtml(cmp,refLabel,nowLabel)}${compareExplainHtml(cmp,refLabel)}
+    <div class="cmp" style="margin-top:12px"><div>
+      <div class="sec-title" style="margin:0 0 6px"><h4 class="muted" style="font-weight:500">Mayores variaciones</h4><label class="xs muted">Métrica <select id="cmpMetric" aria-label="Métrica de las mayores variaciones">${metricOptions(cmp,metric)}</select></label></div>
+      ${moversHtml(cmp,metric)}
+    </div><div>${metric==='units'?'':distChart(ser.a,ser.b,METRIC_LBL[metric]).replace('>Original<','>'+esc(refLabel)+'<').replace('>Actual<','>'+esc(nowLabel)+'<')}</div></div>`;
+}
+function bindCompareMetric(root,rerender){ const m=root.querySelector('#cmpMetric'); if(m) m.onchange=e=>{ CMP_METRIC=e.target.value; rerender(); }; }
+// filtro de la tabla: cambios por métrica
+const CHANGE_OPTS=[['','Todas las personas'],['any','Con algún cambio comparable'],['prod','Cambia Productividad'],['units','Cambian unidades computables'],['qual','Cambia Calidad'],['soft','Cambia Soft Skills'],['total','Cambia el puntaje total'],['partial','Cambia el puntaje parcial'],['avail','Cambia la disponibilidad de Soft Skills'],['nc','Sin puntaje total comparable']];
+function changeMatch(p,mode){ if(!mode) return true; if(!p) return false; if(mode==='any') return p.changed.length>0; if(mode==='avail') return !!p.availChange; if(mode==='nc') return p.comp.total.state==='nc'||p.comp.total.state==='one'; return p.changed.includes(mode); }
+function metricLabel(cmp,m){ return METRIC_LBL[m]||m; }
+
 let CMP=null; let REFIDX=-1; // -1 = escenario original (Base sin cambios); >=0 = índice de escenario guardado
 function refConfig(){ return REFIDX>=0&&scenarios[REFIDX]? JSON.parse(JSON.stringify(scenarios[REFIDX])) : makeScenario(PRESETS[0]); }
 function refName(){ return REFIDX>=0&&scenarios[REFIDX]? scenarios[REFIDX].name : 'Base original'; }
@@ -1015,25 +1130,10 @@ function renderResults(rows){
   // comparison vs reference (each scenario evaluated with its own values)
   const cRef=refConfig(); const refRows=rowsFor(cRef);
   const cmp=compareRows(refRows,rows,cRef,c);
-  const ds=cmp.pairs.filter(p=>p.d!=null); const up=ds.filter(p=>p.d>0.05).length, down=ds.filter(p=>p.d<-0.05).length, same=ds.length-up-down;
-  const va=ds.map(p=>p.a), vb=ds.map(p=>p.b);
-  const refProd=refRows.filter(r=>r.prod.score!=null).map(r=>r.prod.score), refQual=refRows.filter(r=>!r.leader&&r.qual.adj!=null).map(r=>r.qual.adj), refSoft=refRows.filter(r=>!r.leader&&r.soft!=null).map(r=>r.soft);
-  const line=(k,a,b,note)=>{ const d=(a!=null&&b!=null)?b-a:null; return `<div class="cmpline"><span class="k">${k}${note?`<span class="sub">${note}</span>`:''}</span><span class="a num">${f1(a)}</span><span class="b num">${f1(b)}</span><span class="delta ${d==null?'zero':d>0.05?'pos':d<-0.05?'neg':'zero'}">${d==null?'n/c':sgn(d)}</span></div>`; };
-  const movers=ds.filter(p=>Math.abs(p.d)>0.05).sort((x,y)=>Math.abs(y.d)-Math.abs(x.d)).slice(0,8); const maxD=Math.max(...movers.map(m=>Math.abs(m.d)),0.1);
   const sameCfg=REFIDX<0&&isBaseline(c);
   const refSel=`<label class="small muted">Comparar con <select id="refSel" aria-label="Escenario de referencia"><option value="-1" ${REFIDX<0?'selected':''}>Base original</option>${scenarios.map((s,i)=>`<option value="${i}" ${i===REFIDX?'selected':''}>${esc(s.name)}</option>`).join('')}</select></label>`;
-  document.getElementById('resCmp').innerHTML=`<h2>¿Qué cambia con esta configuración? <span class="n">${refSel} → ${esc(c.name)}</span></h2>
-    ${sameCfg?`<div class="empty"><b>Todavía no cambiaste nada.</b> Modificá un objetivo, activá las creaciones BC, cambiá el método de calidad o simulá valores de Soft Skills y acá vas a ver quién sube, quién baja y cuánto.</div>`:`
-    <div class="cmp"><div>
-      <div class="cmpline" style="border-top:none;padding-top:0"><span class="k xs">Métrica</span><span class="a xs">${esc(refName())}</span><span class="b xs" style="font-weight:400;color:var(--muted)">Actual</span><span class="xs muted">Dif.</span></div>
-      ${line('Productividad promedio',mean(refProd),mean(prodS))}${line('Calidad promedio',mean(refQual),mean(qualS))}${line('Soft Skills promedio',mean(refSoft),mean(softS),(refSoft.length||softS.length)?`${refSoft.length} vs ${softS.length} personas con valor`:'sin valores en ambos')}${line(cmp.label+' promedio',mean(va),mean(vb),cmp.nNc?`${cmp.nNc} persona${cmp.nNc>1?'s':''} no comparable${cmp.nNc>1?'s':''}: solo un lado tiene puntaje total`:'')}
-      <div class="updown" style="margin-top:10px"><span><b class="delta pos">${up}</b><span class="muted">suben</span></span><span><b class="delta neg">${down}</b><span class="muted">bajan</span></span><span><b>${same}</b><span class="muted">sin cambios</span></span>${cmp.nNc?`<span><b class="muted">${cmp.nNc}</b><span class="muted">no comparables</span></span>`:''}<span class="muted xs" style="align-self:end">${ds.length} comparables${cmp.nPartial&&!cmp.nTotal?' · puntaje parcial':''}</span></div>
-      ${cmp.nNc&&REFIDX<0?`<p class="hint">El Base original no tiene Soft Skills. Para comparar puntajes totales, guardá la configuración con Soft Skills como escenario y elegilo como referencia.</p>`:''}
-    </div><div>
-      <h4 class="muted" style="font-weight:500;margin-bottom:6px">Mayores variaciones</h4>
-      <div class="moves">${movers.length?movers.map(m=>`<div class="move"><span class="nm">${esc(m.name)}</span><span class="delta ${m.d>0?'pos':'neg'}" style="text-align:right">${sgn(m.d)}</span><div class="bar"><i class="${m.d>0?'pos':'neg'}" style="width:${(Math.abs(m.d)/maxD*50).toFixed(1)}%"></i></div></div>`).join(''):'<span class="muted small">Nadie cambia de puntaje.</span>'}</div>
-    </div></div>
-    <div style="margin-top:12px">${distChart(va,vb,cmp.label).replace('>Original<','>'+esc(refName())+'<')}</div>`}`;
+  document.getElementById('resCmp').innerHTML=`<h2>¿Qué cambia con esta configuración? <span class="n">${refSel} → ${esc(c.name)}</span></h2>${renderCompareBlock(cmp,refName(),c.name,sameCfg)}`;
+  bindCompareMetric(document.getElementById('resCmp'),()=>renderResults(ROWS));
   document.getElementById('resNow').querySelectorAll('[data-state]').forEach(b=>b.onclick=()=>{ document.getElementById('fState').value=b.dataset.state; renderTable(ROWS); document.getElementById('people').scrollIntoView({behavior:'smooth',block:'start'}); });
   const rs=document.getElementById('refSel'); if(rs) rs.onchange=e=>{ REFIDX=+e.target.value; renderAll(); };
   CMP=cmp;
@@ -1062,7 +1162,7 @@ const EXEC_COLS=[
   ['qadj','Calidad',r=>r.qual.status==='na'?(r.leader?'<span class="muted">—</span>':'<span class="pill neu" title="La calidad no aplica a esta modalidad">No aplica</span>'):r.qual.adj==null?`<span class="muted">—</span>`:`<span class="score"><span><span class="big num">${f1(r.qual.adj)}</span><span class="sub">${r.qual.nAud} auditorías · ${r.qual.detail.filter(d=>!d.excluded).length} flujos${r.qual.hasOverride?' · corregida':''}</span></span><span class="mini"><i style="width:${Math.min(100,r.qual.adj)}%"></i></span></span>`,'r'],
   ['soft','Soft Skills',r=>{ const si=SOFTINFO[r.uid]; if(r.leader||!si||si.source==='manual') return '<span class="muted">—</span>'; if(si.invalid) return '<span class="pill crit">pesos inválidos</span>'; if(r.soft==null) return `<span class="muted">pendiente</span><span class="sub">${si.missing&&si.missing.length?si.missing.length+' criterio'+(si.missing.length>1?'s':'')+' sin evaluación':'sin evaluaciór'}</span>`; return `<span class="big num">${f1(r.soft)}</span><span class="sub">${si.source==='legacy'?'heredado · ':''}${r.softStatus==='conf'?'confirmado':(si.rows.length&&si.rows.every(x=>x.origin==='std')?'estándar':'simulado')}${si.partial?' · parcial':''}</span>`; },'r'],
   ['final','Puntaje',r=>{ if(r.leader_res){ const x=r.leader_res; return x.score==null?'<span class="muted">—</span>':`<span class="big num">${f1(x.score)}</span><span class="sub">${x.kind==='TL'?'Modelo '+cfg().leaders.selected:'gestión pedagógica'}${x.gest.status==='sim'?' · simulado':''}</span>`; } const v=r.final!=null?r.final:partialScore(r,cfg()); if(v==null) return '<span class="muted">—</span>'; return `<span class="big num ${r.final==null?'muted':''}" title="${r.final==null?'Puntaje parcial: Productividad + Calidad':'Puntaje total'}">${f1(v)}</span><span class="sub">${r.final==null?'parcial':(r.softStatus==='sim'?'total · Soft simulado':'total')}${r.rank?' · #'+r.rank:''}</span>`; },'r'],
-  ['delta','Variación',r=>{ const p=CMP&&CMP.pairs.find(x=>x.uid===r.uid); if(!p||p.d==null) return '<span class="muted">—</span>'; if(p.basis==='nc') return '<span class="muted" title="Solo un escenario tiene puntaje total">n/c</span>'; return `<span class="delta ${p.d>0.05?'pos':p.d<-0.05?'neg':'zero'}">${sgn(p.d)}</span>${(p.dp&&Math.abs(p.dp)>0.05)||(p.dq&&Math.abs(p.dq)>0.05)||(p.ds&&Math.abs(p.ds)>0.05)?`<span class="sub">${[p.dp&&Math.abs(p.dp)>0.05?'prod '+sgn(p.dp):'',p.dq&&Math.abs(p.dq)>0.05?'cal '+sgn(p.dq):'',p.ds&&Math.abs(p.ds)>0.05?'soft '+sgn(p.ds):''].filter(Boolean).join(' · ')}</span>`:''}`; },'r'],
+  ['delta','Variación',r=>deltaCell(r,false),'r'],
   ['estado','Estado',r=>{ const s=statusOf(r); return `<span class="pill ${s.cls}" title="${esc(s.why)}">${s.l}</span>`; },'l'],
 ];
 const TECH_COLS=[
@@ -1075,27 +1175,34 @@ const TECH_COLS=[
   ['qraw','Calidad original',r=>r.qual.status==='na'?'n/a':f1(r.qual.raw),'r'],['qadj','Calidad corregida',r=>`<strong>${f1(r.qual.adj)}</strong>${r.qual.hasOverride?' <span class="pill warn">corr.</span>':''}`,'r'],
   ['soft','Soft Skills',r=>r.soft==null?'<span class="muted">—</span>':`${f1(r.soft)} <span class="pill ${r.softStatus==='conf'?'ok':'warn'}">${r.softStatus==='conf'?'confirmado':'simulado'}</span>${SOFTINFO[r.uid]&&SOFTINFO[r.uid].source==='legacy'?' <span class="pill neu">heredado</span>':''}`,'r'],
   ['final','Puntaje total',r=>`<strong>${f1(r.final)}</strong>${r.rank?` <span class="muted">#${r.rank}</span>`:''}`,'r'],
-  ['delta','Variación',r=>{ const p=CMP&&CMP.pairs.find(x=>x.uid===r.uid); if(p&&p.basis==='nc') return '<span class="muted">n/c</span>'; return p&&p.d!=null?`<span class="delta ${p.d>0.05?'pos':p.d<-0.05?'neg':'zero'}">${sgn(p.d)}</span>`:'—'; },'r'],
+  ['delta','Variación',r=>deltaCell(r,true),'r'],
   ['estado','Estado',r=>{ const s=statusOf(r); const w=r.warns.filter(x=>x!=='Soft Skills pendiente'); return `<span class="pill ${s.cls}">${s.l}</span>${w.length?` <span class="muted xs" title="${esc(w.join(' · '))}">${w.length} aviso${w.length>1?'s':''}</span>`:''}`; },'l'],
 ];
-const sortVal={name:r=>r.name,team:r=>r.team,role:r=>r.role,prof:r=>r.prof,jorn:r=>r.prod.jornadas,cdmT:r=>r.prod.cdmTotal,cdmA:r=>r.prod.cdmAvg,bc:r=>r.prod.bcTotal,comb:r=>r.prod.combined,pct:r=>r.prod.pct,ccc:r=>r.prod.cccShare,pscore:r=>r.prod.score,aud:r=>r.qual.nAud,qraw:r=>r.qual.raw,qadj:r=>r.qual.adj,soft:r=>r.soft,final:r=>r.final!=null?r.final:partialScore(r,cfg()),delta:r=>{const p=CMP&&CMP.pairs.find(x=>x.uid===r.uid);return p?p.d:null;},estado:r=>statusOf(r).k,order:r=>r.order};
+function deltaCell(r,tech){ const p=CMP&&CMP.pairs.find(x=>x.uid===r.uid); if(!p||r.leader&&p.comp.total.state==='none') return '<span class="muted">—</span>'; const c=p.comp; const dc=d=>`<span class="delta ${d>0.05?'pos':d<-0.05?'neg':'zero'}">${sgn(d)}</span>`;
+  const tot= c.total.state==='ok'||c.total.state==='partial'? `${dc(c.total.d)}${c.total.state==='partial'?'<span class="sub">parcial</span>':''}` : c.total.state==='none'? '<span class="muted">—</span>' : `<span class="muted" title="${esc(c.total.why)}">n/c</span><span class="sub">total: ${esc(c.total.why)}</span>`;
+  if(tech) return tot;
+  const parts=[]; if(c.prod.state==='ok'&&Math.abs(c.prod.d)>0.05) parts.push('prod '+sgn(c.prod.d)); else if(c.prod.capped) parts.push('prod sin cambio: tope 100'); if(c.qual.state==='ok'&&Math.abs(c.qual.d)>0.05) parts.push('cal '+sgn(c.qual.d)); if(c.soft.state==='ok'&&Math.abs(c.soft.d)>0.05) parts.push('soft '+sgn(c.soft.d)); if(c.soft.avail) parts.push('soft: '+c.soft.why); if(p.units&&Math.abs(p.units.d)>0.05) parts.push(fmtUnits(p.units.d,true)+' unid.');
+  return `${tot}${parts.length?`<span class="sub">${esc(parts.join(' · '))}</span>`:''}`; }
+const sortVal={name:r=>r.name,team:r=>r.team,role:r=>r.role,prof:r=>r.prof,jorn:r=>r.prod.jornadas,cdmT:r=>r.prod.cdmTotal,cdmA:r=>r.prod.cdmAvg,bc:r=>r.prod.bcTotal,comb:r=>r.prod.combined,pct:r=>r.prod.pct,ccc:r=>r.prod.cccShare,pscore:r=>r.prod.score,aud:r=>r.qual.nAud,qraw:r=>r.qual.raw,qadj:r=>r.qual.adj,soft:r=>r.soft,final:r=>r.final!=null?r.final:partialScore(r,cfg()),delta:r=>{const p=CMP&&CMP.pairs.find(x=>x.uid===r.uid); if(!p) return null; const m=CMP_METRIC||defaultMetric(CMP); const d=metricDelta(p,m); return d!=null?d:(p.d!=null?p.d:null);},estado:r=>statusOf(r).k,order:r=>r.order};
 function filtered(rows){
-  const t=document.getElementById('fTeam').value, pf=document.getElementById('fProfile').value, st=document.getElementById('fState').value, tx=document.getElementById('fText').value.toLowerCase(), ch=document.getElementById('fChanged').checked;
-  return rows.filter(r=>(!t||r.team===t)&&(!pf||r.mode===pf)&&(!st||statusOf(r).k===st)&&(!tx||r.name.toLowerCase().includes(tx))&&(!ch||(CMP&&(()=>{const p=CMP.pairs.find(x=>x.uid===r.uid);return p&&p.d!=null&&Math.abs(p.d)>0.05;})())));
+  const t=document.getElementById('fTeam').value, pf=document.getElementById('fProfile').value, st=document.getElementById('fState').value, tx=document.getElementById('fText').value.toLowerCase(), ch=document.getElementById('fChange').value;
+  return rows.filter(r=>(!t||r.team===t)&&(!pf||r.mode===pf)&&(!st||statusOf(r).k===st)&&(!tx||r.name.toLowerCase().includes(tx))&&(!ch||changeMatch(CMP&&CMP.pairs.find(x=>x.uid===r.uid),ch)));
 }
+function filterDesc(){ const parts=[]; const v=id=>document.getElementById(id).value; const ch=v('fChange'); if(ch){ const o=CHANGE_OPTS.find(x=>x[0]===ch); const s=CMP&&CMP.summary; let hint=''; if(s&&ch==='total'&&!s.total.n) hint=` (ninguna persona tiene puntaje total comparable: ${Object.keys(s.total.whys)[0]||'falta un componente'})`; else if(s&&ch==='any'&&!CMP.pairs.some(p=>p.changed.length)) hint=' (los dos escenarios dan los mismos resultados comparables)'; parts.push(`cambio: “${o?o[1]:ch}”${hint}`); } if(v('fTeam')) parts.push('equipo: '+esc(v('fTeam'))); if(v('fProfile')) parts.push('modalidad: '+esc(MODES[v('fProfile')]||v('fProfile'))); if(v('fState')) parts.push('estado: '+esc((document.querySelector(`#fState option[value="${v('fState')}"]`)||{}).textContent||v('fState'))); if(v('fText')) parts.push('búsqueda: “'+esc(v('fText'))+'”'); return parts.length?'Filtros aplicados: '+parts.join(' · ')+'.':''; }
 function renderTable(rows){
   const cols=state.tech?TECH_COLS:EXEC_COLS; const {key,dir}=state.sort; const g=sortVal[key]||sortVal.order;
   const rs=filtered(rows).sort((a,b)=>{ const x=g(a),y=g(b); if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1; return (x<y?-1:x>y?1:0)*dir; });
   document.getElementById('tblwrap').classList.toggle('tech',state.tech);
   document.querySelector('#mainTable thead').innerHTML='<tr>'+cols.map(([k,l,,al])=>`<th class="${al} ${key===k?'sorted':''}" data-key="${k}" scope="col">${l}${key===k?(dir>0?' ▲':' ▼'):''}</th>`).join('')+'</tr>';
-  document.querySelector('#mainTable tbody').innerHTML=rs.length?rs.map(r=>`<tr class="click ${state.selected===r.uid?'sel':''}" data-uid="${r.uid}" tabindex="0">${cols.map(([k,,f,al])=>`<td class="${al} ${['pscore','qadj','final','delta','jorn','cdmT','cdmA','bc','comb','pct','ccc','aud','qraw','soft'].includes(k)?'num':''}">${f(r)}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${cols.length}" class="muted" style="padding:18px">Ninguna persona coincide con los filtros.</td></tr>`;
+  document.querySelector('#mainTable tbody').innerHTML=rs.length?rs.map(r=>`<tr class="click ${state.selected===r.uid?'sel':''}" data-uid="${r.uid}" tabindex="0">${cols.map(([k,,f,al])=>`<td class="${al} ${['pscore','qadj','final','delta','jorn','cdmT','cdmA','bc','comb','pct','ccc','aud','qraw','soft'].includes(k)?'num':''}">${f(r)}</td>`).join('')}</tr>`).join(''):`<tr><td colspan="${cols.length}" style="padding:18px"><div class="empty"><b>Ninguna persona coincide con los filtros.</b> ${filterDesc()} <button class="sm" id="clearFilters" style="margin-left:6px">Quitar filtros</button></div></td></tr>`;
+  const cf=document.getElementById('clearFilters'); if(cf) cf.onclick=()=>{ ['fTeam','fProfile','fState','fText','fChange'].forEach(id=>document.getElementById(id).value=''); renderTable(ROWS); };
   document.getElementById('rowCount').textContent=`${rs.length} de ${rows.length}`;
-  document.getElementById('tblFoot').innerHTML=state.tech?'CDM = IDs únicos por jornada. “Productividad con BC” = CDM + creaciones × equivalencia, por jornada. Calidad original = según auditorías; corregida = con devoluciones aceptadas.':'Elegí una persona para ver de dónde sale su puntaje. “Variación” compara contra el escenario original (Base).';
+  document.getElementById('tblFoot').innerHTML=state.tech?'CDM = IDs únicos por jornada. “Productividad con BC” = CDM + creaciones × equivalencia, por jornada. Calidad original = según auditorías; corregida = con devoluciones aceptadas.':`Elegí una persona para ver de dónde sale su puntaje. “Variación” compara contra ${esc(refName())} por componente: el total solo cuando ambos escenarios lo tienen.`;
 }
 document.querySelector('#mainTable thead').addEventListener('click',e=>{ const th=e.target.closest('th'); if(!th) return; const k=th.dataset.key; if(state.sort.key===k) state.sort.dir*=-1; else state.sort={key:k,dir:(['name','team','role','prof','estado'].includes(k)?1:-1)}; renderTable(ROWS); });
 document.querySelector('#mainTable tbody').addEventListener('click',e=>{ const tr=e.target.closest('tr[data-uid]'); if(tr) openDetail(tr.dataset.uid); });
 document.querySelector('#mainTable tbody').addEventListener('keydown',e=>{ if(e.key==='Enter'){ const tr=e.target.closest('tr[data-uid]'); if(tr){ e.preventDefault(); openDetail(tr.dataset.uid); } } });
-['fTeam','fProfile','fState','fText','fChanged'].forEach(id=>document.getElementById(id).addEventListener('input',()=>renderTable(ROWS)));
+['fTeam','fProfile','fState','fText','fChange'].forEach(id=>document.getElementById(id).addEventListener('input',()=>renderTable(ROWS)));
 document.getElementById('techView').addEventListener('change',e=>{ state.tech=e.target.checked; renderTable(ROWS); });
 (function initFilters(){ document.getElementById('fTeam').innerHTML+=[...new Set(PEOPLE.map(p=>p.team))].map(t=>`<option>${esc(t)}</option>`).join('');
   document.getElementById('fState').innerHTML+=[['completo','Completo'],['provsim','Provisional: Soft simulado'],['provsin','Provisional: falta Soft Skills'],['softmodel','Pesos de Soft Skills inválidos'],['multi','Cambio de modalidad: pendiente'],['transicion','Transición de modalidad: provisional'],['calnoeval','Calidad no evaluable'],['sinaud','Sin auditorías'],['sinjornadas','Sin jornadas computables'],['sindatos','Sin datos en el período'],['lidok','Líder: evaluado'],['lidsim','Líder: simulado'],['lidprov','Líder: provisional'],['lidpend','Líder: pendiente'],['manual','No se evalúa']].map(([k,l])=>`<option value="${k}">${l}</option>`).join(''); })();
@@ -1244,30 +1351,18 @@ function renderScenarios(){
   const presets=PRESETS.map(p=>`<button class="sm" data-preset="${p.key}">${esc(p.name)}</button>`).join('');
   const opts=i=>scenarios.map((s,j)=>`<option value="${j}" ${j===i?'selected':''}>${esc(s.name)}</option>`).join('');
   const cA=scenarios[cmpA], cB=scenarios[cmpB]; const A=rowsFor(JSON.parse(JSON.stringify(cA))), B=rowsFor(JSON.parse(JSON.stringify(cB)));
-  const cmp=compareRows(A,B,cA,cB); const ds=cmp.pairs.filter(p=>p.d!=null);
-  const va=ds.map(p=>p.a), vb=ds.map(p=>p.b); const up=ds.filter(p=>p.d>0.05).length, down=ds.filter(p=>p.d<-0.05).length;
-  const prodA=A.filter(r=>r.prod.score!=null).map(r=>r.prod.score), prodB=B.filter(r=>r.prod.score!=null).map(r=>r.prod.score);
-  const qA=A.filter(r=>!r.leader&&r.qual.adj!=null).map(r=>r.qual.adj), qB=B.filter(r=>!r.leader&&r.qual.adj!=null).map(r=>r.qual.adj);
-  const sA=A.filter(r=>!r.leader&&r.soft!=null).map(r=>r.soft), sB=B.filter(r=>!r.leader&&r.soft!=null).map(r=>r.soft);
-  const line=(k,a,b)=>{ const d=(a!=null&&b!=null)?b-a:null; return `<div class="cmpline"><span class="k">${k}</span><span class="a num">${f1(a)}</span><span class="b num">${f1(b)}</span><span class="delta ${d==null?'zero':d>0.05?'pos':d<-0.05?'neg':'zero'}">${d==null?'n/c':sgn(d)}</span></div>`; };
-  const sorted=[...ds].sort((x,y)=>y.d-x.d);
+  const cmp=compareRows(A,B,cA,cB);
+
   document.getElementById('p-escenarios').innerHTML=`
     <div class="sec-title" style="margin-top:0"><h2>Escenarios</h2><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center"><span class="small muted">Nuevo desde:</span>${presets}</div></div>
     <div class="scen-grid">${cards}</div>
     <div class="note small">Los escenarios se guardan en este navegador (no en un servidor). Para llevarlos a otra computadora, copiá la configuración y pegala allá. <button class="linkbtn" id="cpJson">Copiar configuración (JSON)</button> · <button class="linkbtn" id="pasteJson">Pegar configuración</button></div>
     <div id="pasteBox" hidden style="margin-top:8px"><textarea class="out" id="jsonIn" placeholder="Pegá acá el JSON copiado" aria-label="JSON de escenarios"></textarea><div style="margin-top:6px;display:flex;gap:8px"><button class="sm primary" id="importJson">Importar escenarios</button><button class="sm" id="cancelJson">Cancelar</button></div></div>
     <div class="sec-title"><h2>Comparar dos escenarios</h2><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label class="small">A <select id="cmpA">${opts(cmpA)}</select></label><span class="muted">→</span><label class="small">B <select id="cmpB">${opts(cmpB)}</select></label></div></div>
-    ${cmp.nPartial&&!cmp.nTotal?'<p class="note small">Ninguno de los dos escenarios tiene Soft Skills: se compara el <b>puntaje parcial</b> (Productividad + Calidad).</p>':''}${cmp.nNc?`<p class="note warn small">${cmp.nNc} persona${cmp.nNc>1?'s':''} no comparable${cmp.nNc>1?'s':''}: solo uno de los escenarios tiene su puntaje total. No se fabrica una diferencia.</p>`:''}
-    <div class="two">
-      <div class="card"><div class="cmpline" style="border-top:none;padding-top:0"><span class="k xs">Métrica</span><span class="xs muted">A</span><span class="xs muted">B</span><span class="xs muted">Dif.</span></div>
-        ${line('Productividad promedio',mean(prodA),mean(prodB))}${line('Calidad promedio',mean(qA),mean(qB))}${line('Soft Skills promedio',mean(sA),mean(sB))}${line(cmp.label+' promedio',mean(va),mean(vb))}${line('Mediana',median(va),median(vb))}${line('Dispersión (desvío)',sd(va),sd(vb))}
-        <div class="updown" style="margin-top:10px"><span><b class="delta pos">${up}</b><span class="muted">suben</span></span><span><b class="delta neg">${down}</b><span class="muted">bajan</span></span><span><b>${ds.length-up-down}</b><span class="muted">sin cambios</span></span><span><b>${ds.filter(p=>Math.abs(p.d)>3).length}</b><span class="muted">cambian &gt;3 pts</span></span><span><b>${ds.filter(p=>Math.abs(p.d)>5).length}</b><span class="muted">&gt;5 pts</span></span><span><b>${cmp.pairs.filter(p=>p.rankA&&p.rankB&&p.rankA!==p.rankB).length}</b><span class="muted">cambian de puesto</span></span></div>
-        ${distChart(va,vb,cmp.label).replace('Original','A: '+esc(cA.name)).replace('Actual','B: '+esc(cB.name))}</div>
-      <div class="card"><h3>Más beneficiados (B − A)</h3><ul>${sorted.slice(0,5).filter(p=>p.d>0.05).map(p=>`<li>${esc(p.name)} <span class="delta pos">${sgn(p.d)}</span></li>`).join('')||'<li class="muted">Nadie sube.</li>'}</ul><h3 style="margin-top:12px">Más perjudicados</h3><ul>${sorted.slice(-5).reverse().filter(p=>p.d<-0.05).map(p=>`<li>${esc(p.name)} <span class="delta neg">${sgn(p.d)}</span></li>`).join('')||'<li class="muted">Nadie baja.</li>'}</ul></div>
-    </div>
+    <div class="card">${renderCompareBlock(cmp,'A: '+cA.name,'B: '+cB.name,false)}</div>
     <div class="sec-title"><h3>Detalle por persona</h3></div>
-    <div class="card" style="padding:0"><div class="tblwrap"><table><thead><tr><th>Colaborador</th><th class="r">A</th><th class="r">B</th><th class="r">Dif.</th><th class="r">Puesto A → B</th><th class="r">Prod. A</th><th class="r">Prod. B</th><th class="r">Calidad A</th><th class="r">Calidad B</th><th class="r">Soft A</th><th class="r">Soft B</th></tr></thead><tbody>
-      ${cmp.pairs.sort((x,y)=>(y.d??-1e9)-(x.d??-1e9)).map(p=>{ const a=A.find(r=>r.uid===p.uid), b=B.find(r=>r.uid===p.uid); return `<tr><td>${esc(p.name)}</td><td class="r num">${f1(p.a)}</td><td class="r num">${f1(p.b)}</td><td class="r">${p.basis==='nc'?'<span class="muted">n/c</span>':`<span class="delta ${p.d>0.05?'pos':p.d<-0.05?'neg':'zero'}">${sgn(p.d)}</span>`}</td><td class="r num">${p.rankA||'—'} → ${p.rankB||'—'}</td><td class="r num">${f1(a.prod.score)}</td><td class="r num">${f1(b.prod.score)}</td><td class="r num">${f1(a.qual.adj)}</td><td class="r num">${f1(b.qual.adj)}</td><td class="r num">${f1(a.soft)}${a.softStatus==='sim'?'<span class="muted xs"> sim.</span>':''}</td><td class="r num">${f1(b.soft)}${b.softStatus==='sim'?'<span class="muted xs"> sim.</span>':''}</td></tr>`; }).join('')}</tbody></table></div></div>`;
+    <div class="card" style="padding:0"><div class="tblwrap"><table><thead><tr><th>Colaborador</th><th class="r">A</th><th class="r">B</th><th class="r">Dif.</th><th class="r">Puesto A → B</th><th class="r">Unid. A</th><th class="r">Unid. B</th><th class="r">Prod. A</th><th class="r">Prod. B</th><th class="r">Dif. prod.</th><th class="r">Calidad A</th><th class="r">Calidad B</th><th class="r">Soft A</th><th class="r">Soft B</th></tr></thead><tbody>
+      ${[...cmp.pairs].sort((x,y)=>{ const m=CMP_METRIC||defaultMetric(cmp); return (metricDelta(y,m)??-1e9)-(metricDelta(x,m)??-1e9); }).map(p=>{ const a=A.find(r=>r.uid===p.uid), b=B.find(r=>r.uid===p.uid); return `<tr><td>${esc(p.name)}</td><td class="r num">${f1(p.a)}</td><td class="r num">${f1(p.b)}</td><td class="r">${p.basis==='nc'?`<span class="muted" title="${esc(p.comp.total.why)}">n/c</span>`:p.d==null?'<span class="muted">—</span>':`<span class="delta ${p.d>0.05?'pos':p.d<-0.05?'neg':'zero'}">${sgn(p.d)}</span>`}</td><td class="r num">${p.rankA||'—'} → ${p.rankB||'—'}</td><td class="r num">${p.units?fmtUnits(p.units.a):'—'}</td><td class="r num">${p.units?fmtUnits(p.units.b):'—'}</td><td class="r num">${f1(a.prod.score)}</td><td class="r num">${f1(b.prod.score)}</td><td class="r">${p.comp.prod.state==='ok'?`<span class="delta ${p.comp.prod.d>0.05?'pos':p.comp.prod.d<-0.05?'neg':'zero'}">${sgn(p.comp.prod.d)}</span>${p.comp.prod.capped?'<span class="sub">tope</span>':''}`:`<span class="muted" title="${esc(p.comp.prod.why)}">${p.comp.prod.state==='none'?'—':'n/c'}</span>`}</td><td class="r num">${f1(a.qual.adj)}</td><td class="r num">${f1(b.qual.adj)}</td><td class="r num">${f1(a.soft)}${a.softStatus==='sim'?'<span class="muted xs"> sim.</span>':''}</td><td class="r num">${f1(b.soft)}${b.softStatus==='sim'?'<span class="muted xs"> sim.</span>':''}</td></tr>`; }).join('')}</tbody></table></div></div>`;
   const P=document.getElementById('p-escenarios');
   P.onclick=e=>{ const b=e.target.closest('button'); if(!b) return;
     if(b.dataset.preset){ const pr=PRESETS.find(x=>x.key===b.dataset.preset); const s=makeScenario(pr); if(scenarios.some(x=>x.name===s.name)) s.name+=' '+(scenarios.length+1); scenarios.push(s); active=scenarios.length-1; renderAll(); toast('Escenario creado y aplicado'); }
@@ -1278,6 +1373,7 @@ function renderScenarios(){
     if(b.id==='pasteJson'){ P.querySelector('#pasteBox').hidden=false; P.querySelector('#jsonIn').focus(); }
     if(b.id==='cancelJson') P.querySelector('#pasteBox').hidden=true;
     if(b.id==='importJson'){ try{ const s=JSON.parse(P.querySelector('#jsonIn').value); if(!s||!Array.isArray(s.scenarios)||!s.scenarios.length) throw new Error(); scenarios=s.scenarios.map(x=>migrateSoft(deepMerge(baseline(),x))); active=Math.min(s.active||0,scenarios.length-1); cmpA=cmpB=0; REFIDX=-1; renderAll(); toast(scenarios.length+' escenarios importados'); }catch(err){ toast('El texto pegado no es una configuración válida'); } } };
+  bindCompareMetric(P,renderScenarios);
   P.onchange=e=>{ if(e.target.dataset.rename!=null){ scenarios[+e.target.dataset.rename].name=e.target.value.trim()||'Escenario'; renderAll(); } if(e.target.id==='cmpA'){cmpA=+e.target.value; renderScenarios();} if(e.target.id==='cmpB'){cmpB=+e.target.value; renderScenarios();} };
 }
 
